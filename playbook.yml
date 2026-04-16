@@ -1,0 +1,291 @@
+---
+- name: Deploy Flask App with HTTPS
+  hosts: all
+  become: true
+  vars:
+    ansible_become_allow_same_user: true
+    allow_world_readable_tmpfiles: true
+    app_name: prosoft-test
+    app_user: webapp
+    app_group: webapp
+    app_dir: /opt/{{ app_name }}
+    app_repo: https://github.com/dimilink/prosoft-test
+    app_port: 5000
+    app_host: 127.0.0.1
+
+    server_name: "{{ ansible_default_ipv4.address }}"
+    ssl_cert_path: /etc/ssl/certs/nginx-selfsigned.crt
+    ssl_key_path: /etc/ssl/private/nginx-selfsigned.key
+
+    node_exporter_version: 1.8.0
+
+  tasks:
+    # -------------------------------------------------------------------
+    # 1. Базовая настройка ОС и безопасность
+    # -------------------------------------------------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - python3-pip
+          - python3-venv
+          - nginx
+          - git
+          - ufw
+          - openssl
+        state: present
+
+    # Устанавливаем политику по умолчанию (используем "incoming"/"outgoing")
+    - name: Set UFW default policy to deny incoming
+      ufw:
+        policy: deny
+        direction: incoming
+
+    - name: Set UFW default policy to allow outgoing
+      ufw:
+        policy: allow
+        direction: outgoing
+
+    - name: Configure UFW - Allow SSH
+      ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+        direction: in
+
+    - name: Configure UFW - Allow HTTPS
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+        direction: in
+
+    - name: Configure UFW - Allow HTTP for redirect
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        direction: in
+
+    - name: Configure UFW - Allow Prometheus Node Exporter
+      ufw:
+        rule: allow
+        port: '9100'
+        proto: tcp
+        direction: in
+
+    - name: Enable UFW and reload
+      ufw:
+        state: enabled
+      register: ufw_result
+      failed_when:
+        - ufw_result is failed
+        - "'already enabled' not in ufw_result.msg"
+
+    # -------------------------------------------------------------------
+    # 2. Создание пользователя
+    # -------------------------------------------------------------------
+    - name: Create application group
+      group:
+        name: "{{ app_group }}"
+        system: yes
+
+    - name: Create application user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: no
+
+    # -------------------------------------------------------------------
+    # 3. Развертывание приложения
+    # -------------------------------------------------------------------
+    - name: Ensure clean application directory
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Clone application repository
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        version: main
+      notify: restart flask
+
+    - name: Set ownership to app_user
+      file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: yes
+
+    - name: Install Python dependencies
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: python3 -m venv
+      become: yes
+      environment:
+        HOME: "{{ app_dir }}"
+        USER: "{{ app_user }}"
+
+    - name: Set ownership of virtual environment
+      file:
+        path: "{{ app_dir }}/venv"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: yes
+        state: directory
+
+    # -------------------------------------------------------------------
+    # 4. Systemd сервис для Flask
+    # -------------------------------------------------------------------
+    - name: Create Flask systemd service file
+      copy:
+        content: |
+          [Unit]
+          Description=Flask Development Server for {{ app_name }}
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          Environment="PATH={{ app_dir }}/venv/bin"
+          Environment="FLASK_APP=app.py"
+          Environment="FLASK_ENV=production"
+          Environment="FLASK_RUN_HOST={{ app_host }}"
+          Environment="FLASK_RUN_PORT={{ app_port }}"
+          ExecStart={{ app_dir }}/venv/bin/python -m flask run
+          Restart=on-failure
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/{{ app_name }}.service
+        mode: '0644'
+      notify: restart flask
+
+    - name: Enable and start Flask service
+      systemd:
+        name: "{{ app_name }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    # -------------------------------------------------------------------
+    # 5. Настройка Nginx с HTTPS
+    # -------------------------------------------------------------------
+    - name: Generate self-signed SSL certificate
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout {{ ssl_key_path }}
+        -out {{ ssl_cert_path }}
+        -subj "/CN={{ server_name }}"
+      args:
+        creates: "{{ ssl_cert_path }}"
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Configure Nginx site
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/{{ app_name }}
+        mode: '0644'
+      notify: reload nginx
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ app_name }}
+        dest: /etc/nginx/sites-enabled/{{ app_name }}
+        state: link
+      notify: reload nginx
+
+    # -------------------------------------------------------------------
+    # 6. Установка Node Exporter
+    # -------------------------------------------------------------------
+    - name: Create node_exporter user and group
+      group:
+        name: node_exporter
+        system: yes
+
+    - name: Create node_exporter user
+      user:
+        name: node_exporter
+        group: node_exporter
+        system: yes
+        shell: /usr/sbin/nologin
+
+    - name: Download and install Node Exporter
+      unarchive:
+        src: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+        dest: /tmp
+        remote_src: yes
+
+    - name: Copy Node Exporter binary
+      copy:
+        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+        dest: /usr/local/bin/node_exporter
+        owner: root
+        group: root
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create Node Exporter service
+      copy:
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/node_exporter.service
+        mode: '0644'
+      notify: restart node_exporter
+
+    - name: Start Node Exporter
+      systemd:
+        name: node_exporter
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+  handlers:
+    - name: restart flask
+      systemd:
+        name: "{{ app_name }}"
+        state: restarted
+        daemon_reload: yes
+
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: restart node_exporter
+      systemd:
+        name: node_exporter
+        state: restarted
